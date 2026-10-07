@@ -5,7 +5,7 @@
   "type": "module",
   "packageManager": "pnpm@10.15.1",
   "devDependencies": {
-    "wrangler": "4.136.1"
+    "wrangler": "4.145.0"
   },
   "scripts": {
     "setup": "node vendor/scripts/byo-updater/customer-cli.mjs setup",

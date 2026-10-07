@@ -827,7 +827,7 @@ export async function setup(repository, stateDirectory, dependencies = {}) {
   );
 }
 
-export async function main(argv = process.argv.slice(2), dependencies = {}) {
+async function dispatchCustomerCommand(argv, dependencies) {
   const repository = resolve(process.env.GITHUB_WORKSPACE || process.cwd());
   const stateDirectory = join(repository, '.kinjot', 'deployment');
   const delegated = await (dependencies.selectInstalledControl ?? selectInstalledControl)(
@@ -864,6 +864,22 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
   throw fixed(
     'command must be setup, link, unlink, update, backfill, doctor, repair-guide, or migration-repair',
   );
+}
+
+export async function main(argv = process.argv.slice(2), dependencies = {}) {
+  // Delegation sets this flag in-process. Only an already authenticated control
+  // owns its error output; the bootstrap must retain its own failure handling.
+  const authenticatedControlInvocation = process.env.KINJOT_AUTHENTICATED_CONTROL === '1';
+  try {
+    return await dispatchCustomerCommand(argv, dependencies);
+  } catch (error) {
+    if (authenticatedControlInvocation && argv[0] !== 'doctor') {
+      process.stderr.write(formatCliFailure(error, argv[0]));
+      return 1;
+    }
+    // Doctor must throw through to the frozen bootstrap's diagnostic fallback.
+    throw error;
+  }
 }
 
 export async function runCustomerCli(

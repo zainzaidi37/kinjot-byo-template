@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { resolvePackagePath, verifyPackage } from '../byo-release/manifest.mjs';
+import { copyProcessDiagnostic } from './safe-process.mjs';
 import { adoptTrustList } from '../byo-release/signature.mjs';
 import { parseTrustList } from '../byo-release/trust-list.mjs';
 import { assertApplicable, releaseRecordFor } from './applicability.mjs';
@@ -20,15 +21,22 @@ const SAFE_MIGRATION_SQLSTATES = new Set([
   '23503',
   '23505',
   '23514',
+  '28000',
+  '28P01',
   '40001',
   '40P01',
   '42501',
   '42P01',
+  '42P07',
+  '42701',
+  '42710',
+  '42723',
   '42703',
   '42704',
   '42883',
   '55P03',
   '57014',
+  'JN002',
 ]);
 
 function assertAdapters(adapters, mode) {
@@ -54,13 +62,20 @@ async function callAdapter(name, operation, input) {
     return await operation(input);
   } catch (error) {
     const reason = normalizeUpdaterRefusalReason(error);
+    let candidateSqlstate;
+    try {
+      candidateSqlstate = error?.sqlstate;
+    } catch {
+      // Hostile accessors cannot replace the fixed operation error.
+    }
     const sqlstate =
       name === 'migration apply' &&
-      typeof error?.sqlstate === 'string' &&
-      SAFE_MIGRATION_SQLSTATES.has(error.sqlstate)
-        ? error.sqlstate
+      typeof candidateSqlstate === 'string' &&
+      (SAFE_MIGRATION_SQLSTATES.has(candidateSqlstate) ||
+        (candidateSqlstate.length === 5 && /^KJ0[0-9]{2}$/.test(candidateSqlstate)))
+        ? candidateSqlstate
         : null;
-    throw Object.assign(
+    const failure = Object.assign(
       new Error(`updater ${name} failed${sqlstate ? ` (SQLSTATE ${sqlstate})` : ''}`),
       {
         code: 'updater_operation_failed',
@@ -69,6 +84,10 @@ async function callAdapter(name, operation, input) {
         ...(sqlstate ? { sqlstate } : {}),
       },
     );
+    if (name === 'function deployment' || name === 'web publication') {
+      copyProcessDiagnostic(failure, error);
+    }
+    throw failure;
   }
 }
 
