@@ -72,6 +72,9 @@ function sanitizedTail(stderr, secrets) {
       '[REDACTED]',
     );
   if (!text.trim()) return '';
+  // The runner finds legacy ##[ commands anywhere, even after our line prefix.
+  // Strip controls first so they cannot reassemble a marker after this pass.
+  text = text.replaceAll('##[', '## [');
   // Budget prefixes and newlines too, and keep complete UTF-8 characters.
   const lines = text.trimEnd().split('\n');
   const tail = [];
