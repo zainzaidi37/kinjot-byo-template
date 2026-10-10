@@ -71,6 +71,7 @@ function sanitizedTail(stderr, secrets) {
       /\b(?:sbp_[A-Za-z0-9_-]+|sk-[A-Za-z0-9_-]+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/g,
       '[REDACTED]',
     );
+  if (!text.trim()) return '';
   // Budget prefixes and newlines too, and keep complete UTF-8 characters.
   const lines = text.trimEnd().split('\n');
   const tail = [];
