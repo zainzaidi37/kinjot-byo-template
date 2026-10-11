@@ -11,8 +11,9 @@ web app, or host the web app on your own Cloudflare Pages project.
 
 1. **Create a Supabase project.** Start without AI keys or a Cloudflare account.
    [Project setup](#project-setup)
-2. **Create a repository** using this template and add the required GitHub
-   secrets and variables.
+2. **Create a private repository** using this template and add the required
+   GitHub secrets and variables. Deployment diagnostics remain in its Actions
+   logs; a private repository limits who can read them.
    [Repository configuration](#repository-configuration)
 3. **Configure Supabase Auth** URLs and signup settings.
    [Authentication](#authentication)
@@ -310,7 +311,7 @@ it. So the way back depends on what you have:
 - **Recovery records:** the configuration branch stores progress. `.kinjot/instance.json`
   holds a SHA-256 key fingerprint, product ownership, and lifecycle state;
   the license key stays in GitHub Secrets.
-- **Tooling:** Supabase CLI 2.111.0, pnpm 10.15.1, and Wrangler 4.136.1 are
+- **Tooling:** Supabase CLI 2.118.0, pnpm 10.15.1, and Wrangler 4.145.0 are
   installed before credentials are exposed. The frozen install disables lifecycle
   scripts. Vendored updater, verifier, and Doctor code fetch no npm code.
 

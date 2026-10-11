@@ -2,6 +2,7 @@
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { formatProcessDiagnostic } from './safe-process.mjs';
 import { runUpdate } from './updater.mjs';
 import { createUpdaterAdapters } from './apply-adapters.mjs';
 import { GitCheckpointStore } from './git-checkpoint.mjs';
@@ -21,15 +22,22 @@ const CLI_MIGRATION_SQLSTATES = new Set([
   '23503',
   '23505',
   '23514',
+  '28000',
+  '28P01',
   '40001',
   '40P01',
   '42501',
   '42P01',
+  '42P07',
+  '42701',
+  '42710',
+  '42723',
   '42703',
   '42704',
   '42883',
   '55P03',
   '57014',
+  'JN002',
 ]);
 const GENERIC_FAILURE = 'BYO updater failed. Run doctor and review the operator guide.\n';
 
@@ -49,21 +57,28 @@ export function formatCliFailure(error, command) {
     }
     const refusal = updaterRefusalMessage(error, command);
     if (refusal) return `${refusal}\n`;
+    const candidateOperation = error?.operation;
     if (
       error?.code !== 'updater_operation_failed' ||
-      typeof error.operation !== 'string' ||
-      !Object.hasOwn(CLI_OPERATIONS, error.operation)
+      typeof candidateOperation !== 'string' ||
+      !Object.hasOwn(CLI_OPERATIONS, candidateOperation)
     ) {
       return genericFailure;
     }
-    const operation = CLI_OPERATIONS[error.operation];
+    const operation = CLI_OPERATIONS[candidateOperation];
+    const candidateSqlstate = error.sqlstate;
     const sqlstate =
       operation === 'migration apply' &&
-      typeof error.sqlstate === 'string' &&
-      CLI_MIGRATION_SQLSTATES.has(error.sqlstate)
-        ? ` (SQLSTATE ${error.sqlstate})`
+      typeof candidateSqlstate === 'string' &&
+      (CLI_MIGRATION_SQLSTATES.has(candidateSqlstate) ||
+        (candidateSqlstate.length === 5 && /^KJ0[0-9]{2}$/.test(candidateSqlstate)))
+        ? ` (SQLSTATE ${candidateSqlstate})`
         : '';
-    return `BYO updater ${operation} failed${sqlstate}. ${guidance}\n`;
+    const diagnostic =
+      operation === 'function deployment' || operation === 'web publication'
+        ? formatProcessDiagnostic(error)
+        : '';
+    return `BYO updater ${operation} failed${sqlstate}. ${guidance}\n${diagnostic}`;
   } catch {
     return genericFailure;
   }

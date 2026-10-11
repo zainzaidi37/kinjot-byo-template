@@ -450,6 +450,12 @@ export function createUpdaterAdapters(config, dependencies = {}) {
               }),
               timeoutMs: config.timeoutMs,
               label: `Supabase function deployment: ${slug}`,
+              diagnosticSecrets: [
+                config.managementToken,
+                config.database.password,
+                config.cloudflareToken ?? '',
+                config.cloudflareAccountId ?? '',
+              ],
             });
           }
         },
@@ -481,6 +487,12 @@ export function createUpdaterAdapters(config, dependencies = {}) {
           }),
           timeoutMs: config.timeoutMs,
           label: 'Cloudflare Pages publication',
+          diagnosticSecrets: [
+            config.cloudflareToken,
+            config.managementToken,
+            config.database.password,
+            config.cloudflareAccountId,
+          ],
         });
       });
     },

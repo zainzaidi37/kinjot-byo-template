@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { Buffer } from 'node:buffer';
+import { stripVTControlCharacters } from 'node:util';
 import { delimiter, dirname, isAbsolute } from 'node:path';
 
 const MAX_OUTPUT = 1024 * 1024;
@@ -13,13 +14,91 @@ const SQLSTATES = new Set([
   '40P01',
   '42501',
   '42P01',
+  '42P07',
+  '42701',
+  '42710',
+  '42723',
   '42703',
   '42704',
   '42883',
   '55P03',
   '57014',
-  ...Array.from({ length: 32 }, (_, index) => `JN${String(index + 1).padStart(3, '0')}`),
+  'JN002',
 ]);
+
+// Diagnostics belong only to this control and its formatter, never to state.
+const diagnostics = new WeakMap();
+const MAX_DIAGNOSTIC_BYTES = 2048;
+const DIAGNOSTIC_PREFIX = '  | ';
+
+export function copyProcessDiagnostic(target, source) {
+  const tail = source && typeof source === 'object' ? diagnostics.get(source) : undefined;
+  if (tail) {
+    diagnostics.set(target, tail);
+  }
+  return target;
+}
+
+export function formatProcessDiagnostic(error) {
+  return error && typeof error === 'object' ? (diagnostics.get(error) ?? '') : '';
+}
+
+function sanitizedTail(stderr, secrets) {
+  const values = new Set();
+  for (const secret of secrets) {
+    if (!secret) continue;
+    values.add(secret);
+    const encoded = encodeURIComponent(secret);
+    values.add(encoded);
+    values.add(encoded.replace(/%[0-9A-F]{2}/g, (escape) => escape.toLowerCase()));
+    values.add(encoded.replace(/%20/g, '+'));
+  }
+  const redactValues = (text) => {
+    for (const value of [...values].sort((a, b) => b.length - a.length)) {
+      text = text.split(value).join('[REDACTED]');
+    }
+    return text;
+  };
+  // Redact before ANY tail selection, including credentials crossing its edge.
+  let text = redactValues(stderr);
+  text = stripVTControlCharacters(text)
+    .replace(/\r\n?|[\u0085\u2028\u2029]/g, '\n')
+    .replace(/[\p{Cc}\p{Cf}]/gu, (character) => (character === '\n' ? '\n' : ''));
+  text = redactValues(text)
+    .replace(/\bpostgres(?:ql)?:\/\/[^\s/@]+:[^\s@]*@/gi, 'postgresql://[REDACTED]@')
+    .replace(/\bBearer\s+[^\s]+/gi, 'Bearer [REDACTED]')
+    .replace(
+      /\b(?:sbp_[A-Za-z0-9_-]+|sk-[A-Za-z0-9_-]+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)/g,
+      '[REDACTED]',
+    );
+  if (!text.trim()) return '';
+  // The runner finds legacy ##[ commands anywhere, even after our line prefix.
+  // Strip controls first so they cannot reassemble a marker after this pass.
+  text = text.replaceAll('##[', '## [');
+  // Budget prefixes and newlines too, and keep complete UTF-8 characters.
+  const lines = text.trimEnd().split('\n');
+  const tail = [];
+  let remaining = MAX_DIAGNOSTIC_BYTES;
+  for (
+    let index = lines.length - 1;
+    index >= 0 && remaining > DIAGNOSTIC_PREFIX.length + 1;
+    index--
+  ) {
+    const characters = [];
+    let budget = remaining - DIAGNOSTIC_PREFIX.length - 1;
+    const line = Array.from(lines[index]);
+    for (let offset = line.length - 1; offset >= 0; offset--) {
+      const size = Buffer.byteLength(line[offset]);
+      if (size > budget) break;
+      characters.push(line[offset]);
+      budget -= size;
+    }
+    const printed = `${DIAGNOSTIC_PREFIX}${characters.reverse().join('')}\n`;
+    tail.unshift(printed);
+    remaining -= Buffer.byteLength(printed);
+  }
+  return tail.join('');
+}
 
 export function isolatedCliEnvironment(home, additions = {}, nodeExecutable = process.execPath) {
   if (
@@ -45,15 +124,28 @@ export function isolatedCliEnvironment(home, additions = {}, nodeExecutable = pr
   });
 }
 
-function failure(label, stderr = '') {
+function failure(label, stderr = '', diagnosticSecrets) {
   const found =
     /(?:ERROR|FATAL):\s+([0-9A-Z]{5}):/.exec(stderr)?.[1] ??
     /\bSQLSTATE\s*[(:=]?\s*([0-9A-Z]{5})\b/.exec(stderr)?.[1];
-  const sqlstate = SQLSTATES.has(found) ? found : undefined;
-  return Object.assign(new Error(`${label} failed${sqlstate ? ` (SQLSTATE ${sqlstate})` : ''}`), {
-    code: 'command_failed',
-    ...(sqlstate ? { sqlstate } : {}),
-  });
+  const sqlstate =
+    SQLSTATES.has(found) || (found?.length === 5 && /^KJ0[0-9]{2}$/.test(found))
+      ? found
+      : undefined;
+  const error = Object.assign(
+    new Error(`${label} failed${sqlstate ? ` (SQLSTATE ${sqlstate})` : ''}`),
+    {
+      code: 'command_failed',
+      ...(sqlstate ? { sqlstate } : {}),
+    },
+  );
+  if (diagnosticSecrets) {
+    const tail = sanitizedTail(stderr, diagnosticSecrets);
+    if (tail) {
+      diagnostics.set(error, tail);
+    }
+  }
+  return error;
 }
 
 export function runBoundedProcess({
@@ -65,6 +157,7 @@ export function runBoundedProcess({
   timeoutMs,
   label,
   spawnImpl = spawn,
+  diagnosticSecrets,
 }) {
   if (
     typeof executable !== 'string' ||
@@ -77,10 +170,18 @@ export function runBoundedProcess({
     timeoutMs < 1 ||
     timeoutMs > 15 * 60_000 ||
     typeof label !== 'string' ||
-    !label
+    !label ||
+    typeof input !== 'string' ||
+    (diagnosticSecrets !== undefined &&
+      (!Array.isArray(diagnosticSecrets) ||
+        diagnosticSecrets.some((value) => typeof value !== 'string')))
   ) {
     throw new Error('invalid updater subprocess configuration');
   }
+  const exposesDiagnostic =
+    diagnosticSecrets !== undefined &&
+    (/^Supabase function deployment: [a-z0-9]+(?:-[a-z0-9]+)*$/.test(label) ||
+      label === 'Cloudflare Pages publication');
   return new Promise((resolve, reject) => {
     let child;
     const usesProcessGroup = process.platform !== 'win32';
@@ -90,7 +191,7 @@ export function runBoundedProcess({
         env: Object.freeze({ ...env }),
         detached: usesProcessGroup,
         shell: false,
-        stdio: ['pipe', 'pipe', 'pipe'],
+        stdio: [input.length ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       });
     } catch {
       reject(failure(label));
@@ -139,9 +240,17 @@ export function runBoundedProcess({
         finish(abortError);
         return;
       }
-      const safeFailure = failure(label, Buffer.concat(stderr).toString('utf8'));
-      if (closeCode !== 0) finish(safeFailure);
-      else finish(null, Buffer.concat(stdout));
+      if (closeCode !== 0) {
+        finish(
+          failure(
+            label,
+            Buffer.concat(stderr).toString('utf8'),
+            exposesDiagnostic ? diagnosticSecrets : undefined,
+          ),
+        );
+      } else {
+        finish(null, Buffer.concat(stdout));
+      }
     };
     const abort = (error) => {
       if (settled || abortError) return;
@@ -186,11 +295,13 @@ export function runBoundedProcess({
       closeCode = code;
       finishAfterTermination();
     });
-    child.stdin.once('error', () => abort(failure(label)));
-    try {
-      child.stdin.end(input);
-    } catch {
-      abort(failure(label));
+    if (input.length) {
+      child.stdin.once('error', () => abort(failure(label)));
+      try {
+        child.stdin.end(input);
+      } catch {
+        abort(failure(label));
+      }
     }
   });
 }
