@@ -195,7 +195,11 @@ function git(repository, args) {
 // changes the environment resolves again.
 let resolvedDatabaseEndpoint = null;
 
-async function operatorDatabaseUrl(repository, dependencies = {}) {
+async function operatorDatabaseUrl(
+  repository,
+  dependencies = {},
+  timeoutMs = Number(process.env.KINJOT_UPDATE_TIMEOUT_MS || 120_000),
+) {
   const databaseUrl = process.env.KINJOT_DATABASE_URL;
   const psql = process.env.KINJOT_PSQL_BIN;
   // Without a probe there is no evidence of unreachability, and resolving on a
@@ -203,18 +207,73 @@ async function operatorDatabaseUrl(repository, dependencies = {}) {
   // with a misleading one.
   if (!databaseUrl || !psql) return databaseUrl;
   if (resolvedDatabaseEndpoint?.databaseUrl === databaseUrl) {
+    if (resolvedDatabaseEndpoint.error) throw resolvedDatabaseEndpoint.error;
     return resolvedDatabaseEndpoint.resolved;
   }
-  const timeoutMs = Number(process.env.KINJOT_UPDATE_TIMEOUT_MS || 120_000);
-  const resolved = await (dependencies.resolveDatabaseEndpoint ?? resolveDatabaseEndpoint)({
-    databaseUrl,
-    projectRef: process.env.KINJOT_SUPABASE_PROJECT_REF,
-    managementToken: process.env.SUPABASE_ACCESS_TOKEN,
-    timeoutMs,
-    probe: dependencies.databaseProbe ?? createPsqlProbe({ psql, cwd: repository, timeoutMs }),
-  });
+  let resolved;
+  try {
+    resolved = await (dependencies.resolveDatabaseEndpoint ?? resolveDatabaseEndpoint)({
+      databaseUrl,
+      projectRef: process.env.KINJOT_SUPABASE_PROJECT_REF,
+      managementToken: process.env.SUPABASE_ACCESS_TOKEN,
+      timeoutMs,
+      probe: dependencies.databaseProbe ?? createPsqlProbe({ psql, cwd: repository, timeoutMs }),
+    });
+  } catch (error) {
+    // A failure is memoized like a success, so a fallback path in the same
+    // process neither probes nor calls the Management API a second time.
+    resolvedDatabaseEndpoint = { databaseUrl, error, noticed: false };
+    throw error;
+  }
   resolvedDatabaseEndpoint = { databaseUrl, resolved };
   return resolved;
+}
+
+const DOCTOR_FLAGS = ['--json', '--core', '--allow-billable-voyage'];
+
+function doctorArgsValid(args) {
+  return (
+    args.every((arg) => DOCTOR_FLAGS.includes(arg)) &&
+    !(args.includes('--core') && args.includes('--allow-billable-voyage'))
+  );
+}
+
+// The range `runDoctor` accepts (scripts/byo-doctor/doctor.mjs); outside it the
+// doctor refuses its configuration, so nothing is probed first.
+function doctorTimeoutMs() {
+  const timeoutMs = Number(process.env.KINJOT_DOCTOR_TIMEOUT_MS || 5000);
+  return Number.isInteger(timeoutMs) && timeoutMs >= 1 && timeoutMs <= 60_000 ? timeoutMs : null;
+}
+
+async function doctorDatabaseUrl(repository, dependencies) {
+  const timeoutMs = doctorTimeoutMs();
+  if (timeoutMs === null) return process.env.KINJOT_DATABASE_URL;
+  try {
+    return await operatorDatabaseUrl(repository, dependencies, timeoutMs);
+  } catch {
+    // stderr, not the report's stream: `doctor --json` must stay parseable.
+    if (!resolvedDatabaseEndpoint?.noticed) {
+      (dependencies.stderr ?? process.stderr).write(
+        'Database pooler fallback could not resolve; checking the configured endpoint.\n',
+      );
+      if (resolvedDatabaseEndpoint) resolvedDatabaseEndpoint.noticed = true;
+    }
+    return process.env.KINJOT_DATABASE_URL;
+  }
+}
+
+async function withDoctorDatabaseUrl(repository, dependencies, operation) {
+  const previous = Object.hasOwn(process.env, 'KINJOT_DATABASE_URL')
+    ? process.env.KINJOT_DATABASE_URL
+    : undefined;
+  const resolved = await doctorDatabaseUrl(repository, dependencies);
+  if (resolved !== undefined) process.env.KINJOT_DATABASE_URL = resolved;
+  try {
+    return await operation();
+  } finally {
+    if (previous === undefined) delete process.env.KINJOT_DATABASE_URL;
+    else process.env.KINJOT_DATABASE_URL = previous;
+  }
 }
 
 function operatorConfig(
@@ -276,6 +335,7 @@ export async function selectInstalledControl(
   stateDirectory,
   argv,
   authenticate = authenticateHandoffControl,
+  dependencies = {},
 ) {
   if (process.env.KINJOT_AUTHENTICATED_CONTROL === '1') return false;
   const state = await readHandoffStateFile(stateDirectory);
@@ -354,7 +414,11 @@ export async function selectInstalledControl(
   process.env.KINJOT_AUTHENTICATED_CONTROL = '1';
   let result;
   try {
-    result = await withLegacyOperatorUrlDefaults(() => module.main(effectiveArgv));
+    const runInstalled = () => withLegacyOperatorUrlDefaults(() => module.main(effectiveArgv));
+    result =
+      argv[0] === 'doctor' && doctorArgsValid(argv.slice(1))
+        ? await withDoctorDatabaseUrl(repository, dependencies, runInstalled)
+        : await runInstalled();
   } catch (error) {
     // The same fallback as the authentication catch above, for the same
     // reason: a diagnostic that cannot run when things are broken is
@@ -685,9 +749,7 @@ export async function doctor(repository, stateDirectory, argv, dependencies = {}
   const json = argv.includes('--json');
   const coreOnly = argv.includes('--core');
   const allowBillableVoyage = argv.includes('--allow-billable-voyage');
-  if (argv.some((arg) => !['--json', '--core', '--allow-billable-voyage'].includes(arg)))
-    throw fixed();
-  if (coreOnly && allowBillableVoyage) throw fixed();
+  if (!doctorArgsValid(argv)) throw fixed();
   const durable = await (dependencies.stores ?? stores)(repository, stateDirectory);
   const state = await durable.checkpoint.read();
   if (!state?.updaterControl) {
@@ -709,11 +771,12 @@ export async function doctor(repository, stateDirectory, argv, dependencies = {}
   }
   const manifest = authenticated.manifest;
   const timeoutMs = Number(process.env.KINJOT_DOCTOR_TIMEOUT_MS || 5000);
+  const databaseUrl = await doctorDatabaseUrl(repository, dependencies);
   let database;
   if (process.env.KINJOT_DATABASE_URL) {
     try {
       database = (dependencies.createDatabaseAdapter ?? createDatabaseAdapter)({
-        databaseUrl: process.env.KINJOT_DATABASE_URL,
+        databaseUrl,
         timeoutMs,
       });
     } catch {
@@ -800,11 +863,15 @@ export async function setup(repository, stateDirectory, dependencies = {}) {
   if (updateResult !== undefined && updateResult !== 0) {
     throw new UpdaterRefusal('installed_updater_incomplete');
   }
+  let diagnosticOutput = '';
   const diagnosticExit = await runCustomerDoctor(repository, stateDirectory, ['--core'], {
     ...dependencies,
-    output: () => {},
+    output: (value) => {
+      diagnosticOutput += value;
+    },
   });
   if (diagnosticExit !== 0) {
+    output(diagnosticOutput);
     throw new UpdaterRefusal('core_diagnostics_failed');
   }
 
@@ -834,6 +901,8 @@ async function dispatchCustomerCommand(argv, dependencies) {
     repository,
     stateDirectory,
     argv,
+    undefined,
+    dependencies,
   );
   if (delegated !== false) return delegated === true ? undefined : delegated;
   const [command, ...rest] = argv;

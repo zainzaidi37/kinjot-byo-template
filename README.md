@@ -48,6 +48,10 @@ releases is the workflow's job: a local `pnpm update`, and the
 
 ### Project setup
 
+When creating your Supabase project, untick **Automatically expose new tables**
+under **Security**: leaving it on grants the Data API roles every privilege on
+new tables in `public`.
+
 Choose your deployment mode:
 
 - **`backend-only`** (new-install default): use `byo.kinjot.com` with your own
@@ -97,8 +101,8 @@ Either connection URL from the **Connect** dialog works. Supabase publishes the
 direct host `db.<ref>.supabase.co` over IPv6 only, and GitHub-hosted runners are
 IPv4-only, so if the direct host cannot be reached the workflow reads your
 project's session pooler hostname from the Management API and retries there on
-port 5432. It never guesses that hostname. If neither endpoint answers, the run
-says so and names the session pooler.
+port 5432. Doctor uses the same fallback. It never guesses that hostname. If
+neither endpoint answers, the run says so and names the session pooler.
 
 ### Authentication
 
@@ -132,6 +136,11 @@ Edge Functions → Secrets**:
 Both are needed for the current note-indexing pipeline. The providers bill your
 accounts. Keep these keys in Supabase; do not duplicate them in GitHub or enter
 them in the app. The browser's session-only Recall key is a separate feature.
+
+Alongside the keys, you can set `RECALL_MONTHLY_LIMIT` (default `200`),
+`RECALL_HISTORY_SEARCH_MONTHLY_LIMIT` (default `500`), and
+`VOICE_CREDITS_MONTHLY_LIMIT` (default `1200`). The literal `unlimited` removes
+each quota; `0` restores its default. The app's Usage tab shows the ceilings.
 
 Missing AI configuration does not invalidate a working notes installation.
 Presence of a key is not proof that it is valid or that its provider is healthy.
