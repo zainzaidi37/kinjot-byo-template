@@ -227,9 +227,9 @@ const REFUSAL_DEFINITIONS = Object.freeze({
       "The installed release's manifest is a newer schema than this repository's bootstrap can read. Re-create the deployment repository from the current template, carry over .kinjot/deployment and your secrets, then run update again.",
   }),
   core_diagnostics_failed: Object.freeze({
-    error: 'core installation diagnostics did not pass; run Doctor for details',
+    error: 'core installation diagnostics did not pass; see the report above',
     operator:
-      'Core installation checks did not pass. Run the Doctor workflow to see which check failed.',
+      'Core installation checks did not pass. See the diagnostic report printed above for the failing checks.',
   }),
 });
 
