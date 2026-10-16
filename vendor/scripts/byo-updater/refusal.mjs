@@ -172,7 +172,12 @@ const REFUSAL_DEFINITIONS = Object.freeze({
   }),
   deployment_not_linked: Object.freeze({
     error: 'deployment is not linked',
-    operator: 'This deployment is not linked to a license. Run Setup first, which links it.',
+    operator:
+      'This deployment is not linked to a license. Run Link, then run this operation again.',
+  }),
+  deployment_nothing_to_unlink: Object.freeze({
+    error: 'deployment has no license lifecycle to unlink',
+    operator: 'This deployment is not linked to a license, so there is nothing to unlink.',
   }),
   deployment_already_linked: Object.freeze({
     error: 'deployment is already linked',
