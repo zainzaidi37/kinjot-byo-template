@@ -15,6 +15,8 @@ export const REQUIRED_FUNCTIONS = Object.freeze([
   'usage-limits',
   'mcp-api',
 ]);
+export const AI_SECRET_NAMES = Object.freeze(['OPENAI_API_KEY', 'VOYAGE_API_KEY']);
+
 const versionPattern = /^\d{14}$/;
 const failureCodes = new Set([
   'timeout',
@@ -342,6 +344,24 @@ export async function runDoctor(
         },
         timeoutMs,
       ),
+    aiSecrets: () =>
+      check(
+        adapters.secrets,
+        (value) => {
+          if (
+            !Array.isArray(value) ||
+            value.length > 1_000 ||
+            value.some((entry) => typeof entry?.name !== 'string')
+          )
+            invalid();
+          const names = value.map((entry) => entry.name);
+          if (new Set(names).size !== names.length) invalid();
+          return result('healthy', 'secret_names_read', {
+            presence: AI_SECRET_NAMES.map((name) => ({ name, present: names.includes(name) })),
+          });
+        },
+        timeoutMs,
+      ),
     // Core-only diagnostics withhold the optional provider probes outright: the
     // Voyage probe is billable, so the flag must suppress the call itself rather
     // than trust the caller to omit the adapters. A withheld probe reports
@@ -421,6 +441,14 @@ export function formatReport(report) {
   }
   for (const [name, c] of Object.entries(report.checks)) {
     lines.push(`${name}: ${c.status} (${c.code})`);
+    if (name === 'aiSecrets') {
+      const presence = c.details?.presence
+        ?.map(({ name, present }) => `${name} ${present ? 'present' : 'missing'}`)
+        .join(', ');
+      lines.push(
+        `AI secrets in Supabase: ${presence ?? c.status} (names only; values are never kept or shown)`,
+      );
+    }
     const d = c.details;
     if (!d) continue;
     if (name === 'localMigrations') lines.push(`  ${d.available.length} local versions`);
@@ -469,7 +497,7 @@ export function formatReport(report) {
     );
   }
   lines.push(
-    'Provider health checks only locally supplied credentials. Supabase-only keys are unavailable here.',
+    'Provider health checks only locally supplied credentials. Supabase secret presence does not establish provider health.',
     'Backfill count includes Trash and excludes existing embeddings and all existing jobs, including abandoned jobs.',
     'Function status is deployment metadata, not an invocation or a proof of provider configuration.',
   );

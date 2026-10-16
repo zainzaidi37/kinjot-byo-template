@@ -567,7 +567,13 @@ export async function link(repository, durable, channel, rest, dependencies) {
   ) {
     throw new UpdaterRefusal('channel_mismatch');
   }
-  if (lifecycle?.status === 'linked') throw new UpdaterRefusal('deployment_already_linked');
+  if (lifecycle?.status === 'linked') {
+    // Adopting an instance onto a deployment that is already linked stays refused,
+    // as before: only a plain `link` is the no-op.
+    if (adoption) throw new UpdaterRefusal('deployment_already_linked');
+    process.stdout.write('This deployment is already linked to this license; nothing changed.\n');
+    return;
+  }
   if (lifecycle?.status === 'unlinking') {
     throw new UpdaterRefusal('relink_requires_unlink');
   }
@@ -681,7 +687,7 @@ export async function link(repository, durable, channel, rest, dependencies) {
 async function unlink(durable, channel, rest, dependencies) {
   if (rest.length) throw fixed();
   let lifecycle = await durable.instance.read();
-  if (!lifecycle) throw new UpdaterRefusal('deployment_not_linked');
+  if (!lifecycle) throw new UpdaterRefusal('deployment_nothing_to_unlink');
   const licenseKey = commandLicenseKey(process.env.KINJOT_LICENSE_KEY);
   assertIntentLicense(lifecycle, licenseKey);
   if (lifecycle.storeId !== channel.storeId || lifecycle.productId !== channel.productId) {

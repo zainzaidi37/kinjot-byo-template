@@ -137,10 +137,16 @@ Both are needed for the current note-indexing pipeline. The providers bill your
 accounts. Keep these keys in Supabase; do not duplicate them in GitHub or enter
 them in the app. The browser's session-only Recall key is a separate feature.
 
-Alongside the keys, you can set `RECALL_MONTHLY_LIMIT` (default `200`),
-`RECALL_HISTORY_SEARCH_MONTHLY_LIMIT` (default `500`), and
-`VOICE_CREDITS_MONTHLY_LIMIT` (default `1200`). The literal `unlimited` removes
-each quota; `0` restores its default. The app's Usage tab shows the ceilings.
+Your project has no monthly limit on Recall, semantic history search or paid
+dictation until you set one (from release `0.2.0`; release `0.1.0` applies
+`200`, `500` and `1200` credits by default). To cap one, add
+`RECALL_MONTHLY_LIMIT`, `RECALL_HISTORY_SEARCH_MONTHLY_LIMIT` or
+`VOICE_CREDITS_MONTHLY_LIMIT` with a whole number of 1 or more. The literal
+`unlimited` states "no limit" outright. Any other value, `0` included, counts as
+a mistake and keeps the numbers hosted Kinjot uses (`200`, `500` and `1200`)
+rather than removing the limit, so the Usage tab shows it. Stored images have
+their own fixed ceilings, 1 GB and 2,000 images, which these secrets do not
+change. The app's Usage tab shows the ceilings.
 
 Missing AI configuration does not invalidate a working notes installation.
 Presence of a key is not proof that it is valid or that its provider is healthy.
@@ -231,7 +237,9 @@ above. Standalone Doctor retains the detailed results for all requested checks.
 
 Doctor needs authenticated release inventory from an install attempt. If inventory
 is missing or cannot be authenticated, it makes no diagnostic provider requests.
-It runs from the current template so fixes also apply to older installed releases.
+It runs the installed release's own checks and report, so a change to Doctor reaches
+an installation with its next signed release; only when the installed release cannot
+be authenticated does it fall back to the copy in your repository.
 
 The customer workflow needs only database and Supabase project credentials.
 It does not receive provider keys. The normal AI setup path uses the **Enable
@@ -240,7 +248,9 @@ AI** section of Kinjot Settings to check configuration stored in Supabase.
 The standalone Doctor CLI still supports **locally supplied probe
 credentials** for explicit operator diagnostics. These do not read your
 Supabase secrets. An absent local probe key does not mean your backend's key is
-missing. Its optional Voyage probe can incur a small charge and requires
+missing. Doctor separately reports which of `OPENAI_API_KEY` and `VOYAGE_API_KEY`
+exist in your Supabase project (`AI secrets in Supabase: …`): it lists secret
+names through the Management API and never keeps or shows a value. Its optional Voyage probe can incur a small charge and requires
 `--allow-billable-voyage`. No such probe is part of normal setup.
 
 ### Recovering a failed run
@@ -309,6 +319,12 @@ it. So the way back depends on what you have:
   its license, and deactivate the old activation if the page offers that, or
   email hello@kinjot.com with your order number — then run `setup` in a new
   repository created from this template.
+
+## Workflow log lines you can ignore
+
+- GitHub's “Node.js 20 is deprecated … forced to run on Node.js 24” warning for `pnpm/action-setup` can be ignored because the action is pinned before v6 on purpose.
+- The Supabase CLI's “A new version of Supabase CLI is available” notice can be ignored because this template pins the CLI version.
+- Node's `DEP0169` `url.parse()` deprecation warning printed by pnpm can be ignored.
 
 ## Technical details
 

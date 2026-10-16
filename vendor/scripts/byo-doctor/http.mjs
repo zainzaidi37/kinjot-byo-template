@@ -4,6 +4,7 @@ import { TextDecoder } from 'node:util';
 
 // Official API references:
 // - Supabase: https://supabase.com/docs/reference/api/v1-list-all-functions
+// - Supabase secrets: https://supabase.com/docs/reference/api/v1-list-all-secrets
 // - OpenAI: https://platform.openai.com/docs/api-reference/models/list
 // - Voyage: https://docs.voyageai.com/reference/embeddings-api-1
 
@@ -181,6 +182,24 @@ function parseFunctions(value) {
   });
 }
 
+function parseSecrets(value) {
+  if (!Array.isArray(value) || value.length > 1_000) throw safeError('invalid_response');
+  return value.map((entry) => {
+    if (
+      entry === null ||
+      typeof entry !== 'object' ||
+      Array.isArray(entry) ||
+      typeof entry.name !== 'string' ||
+      entry.name.length < 1 ||
+      entry.name.length > 256 ||
+      hasControlCharacter(entry.name)
+    ) {
+      throw safeError('invalid_response');
+    }
+    return { name: entry.name };
+  });
+}
+
 function providerResult(response) {
   if (!Number.isInteger(response?.status) || response.status < 100 || response.status > 599) {
     discardBody(response);
@@ -220,62 +239,70 @@ export function createHttpAdapters({
   const adapters = {};
 
   if (isPresent(managementToken)) {
-    adapters.functions = async () => {
-      if (
-        !PROJECT_REF.test(projectRef) ||
-        !validCredential(managementToken) ||
-        !validTimeout(timeoutMs) ||
-        typeof fetchImpl !== 'function'
-      ) {
-        throw safeError('invalid_response');
-      }
+    for (const [endpoint, parse] of [
+      ['functions', parseFunctions],
+      ['secrets', parseSecrets],
+    ]) {
+      adapters[endpoint] = async () => {
+        if (
+          !PROJECT_REF.test(projectRef) ||
+          !validCredential(managementToken) ||
+          !validTimeout(timeoutMs) ||
+          typeof fetchImpl !== 'function'
+        ) {
+          throw safeError('invalid_response');
+        }
 
-      try {
-        let activeReader;
-        return await withDeadline(
-          timeoutMs,
-          async (signal) => {
-            const response = await fetchSafely(
-              fetchImpl,
-              signal,
-              `${MANAGEMENT_ORIGIN}/v1/projects/${projectRef}/functions`,
-              {
-                method: 'GET',
-                headers: { authorization: `Bearer ${managementToken}`, accept: 'application/json' },
-              },
-            );
-            if (
-              !Number.isInteger(response?.status) ||
-              response.status < 100 ||
-              response.status > 599
-            ) {
-              discardBody(response);
-              throw safeError('invalid_response');
-            }
-            if (response.status < 200 || response.status >= 300) {
-              discardBody(response);
-              throw safeError(statusCode(response.status));
-            }
-            return parseFunctions(
-              await readLimitedJson(response, (reader) => {
-                activeReader = reader;
-              }),
-            );
-          },
-          () => {
-            try {
-              const cancellation = activeReader?.cancel?.();
-              cancellation?.catch?.(() => {});
-            } catch {
-              // The timeout result must not expose cleanup errors.
-            }
-          },
-        );
-      } catch (error) {
-        if (error instanceof SafeHttpError) throw error;
-        throw safeError('invalid_response');
-      }
-    };
+        try {
+          let activeReader;
+          return await withDeadline(
+            timeoutMs,
+            async (signal) => {
+              const response = await fetchSafely(
+                fetchImpl,
+                signal,
+                `${MANAGEMENT_ORIGIN}/v1/projects/${projectRef}/${endpoint}`,
+                {
+                  method: 'GET',
+                  headers: {
+                    authorization: `Bearer ${managementToken}`,
+                    accept: 'application/json',
+                  },
+                },
+              );
+              if (
+                !Number.isInteger(response?.status) ||
+                response.status < 100 ||
+                response.status > 599
+              ) {
+                discardBody(response);
+                throw safeError('invalid_response');
+              }
+              if (response.status < 200 || response.status >= 300) {
+                discardBody(response);
+                throw safeError(statusCode(response.status));
+              }
+              return parse(
+                await readLimitedJson(response, (reader) => {
+                  activeReader = reader;
+                }),
+              );
+            },
+            () => {
+              try {
+                const cancellation = activeReader?.cancel?.();
+                cancellation?.catch?.(() => {});
+              } catch {
+                // The timeout result must not expose cleanup errors.
+              }
+            },
+          );
+        } catch (error) {
+          if (error instanceof SafeHttpError) throw error;
+          throw safeError('invalid_response');
+        }
+      };
+    }
   }
 
   if (isPresent(openaiKey)) {

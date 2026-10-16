@@ -8,6 +8,13 @@ const COMMIT = /^[a-f0-9]{40}$/;
 const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 const CONFIG_PATH = '.kinjot/instance.json';
 
+function checkpointMessage(value) {
+  if (value === null) return 'Unlink Kinjot release instance';
+  if (value.status === 'linked' && value.phase === 'active') return 'Link Kinjot release instance';
+  const operation = value.status === 'unlinking' ? 'unlink' : 'link';
+  return `Record Kinjot release instance ${operation} progress (${value.phase})`;
+}
+
 function fixed(code = 'checkpoint_failed') {
   return Object.assign(new Error('instance configuration checkpoint failed'), {
     code: 'instance_checkpoint_failed',
@@ -123,7 +130,7 @@ export class GitInstanceStore {
       'user.email=updater@invalid',
       'commit',
       '-m',
-      value ? 'Link Kinjot release instance' : 'Unlink Kinjot release instance',
+      checkpointMessage(value),
       '--',
       CONFIG_PATH,
     ]);
