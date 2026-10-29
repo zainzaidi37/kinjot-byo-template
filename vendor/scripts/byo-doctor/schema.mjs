@@ -129,8 +129,7 @@ export const SCHEMA_PREREQUISITES = Object.freeze(
  * release with a null `minimumPreviousRelease`), and this file is vendored into
  * `customer-template/vendor/`, where it outlives the release it was written
  * beside. An object a later release adds goes here instead, or every new
- * operator is refused at `setup` (issue #608). `fresh-install.test.mjs` holds
- * the core inventory to the base release's migrations.
+ * operator is refused at `setup` (issue #608).
  *
  * `attachment_usage()` arrives with the image-attachments migration. The app
  * already fails soft without it (`PGRST202` is `missing_migration`), so its
