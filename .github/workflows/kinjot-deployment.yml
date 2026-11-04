@@ -81,6 +81,7 @@ jobs:
             --retry 3 --connect-timeout 15 --max-time 420 \
             "https://github.com/supabase/cli/releases/download/v2.118.0/supabase_linux_amd64.tar.gz" \
             -o "$RUNNER_TEMP/supabase.tar.gz"
+          echo "f6089a86fb9d9221c958193a277338daddd6822f706929943812fa32e106c86d  $RUNNER_TEMP/supabase.tar.gz" | sha256sum --check --strict -
           mkdir -p "$RUNNER_TEMP/supabase-extract"
           tar -xzf "$RUNNER_TEMP/supabase.tar.gz" -C "$RUNNER_TEMP/supabase-extract"
           supabase_source="$(dirname "$(find "$RUNNER_TEMP/supabase-extract" -type f -name supabase -print -quit)")"
@@ -90,7 +91,7 @@ jobs:
           chmod +x "$tools/supabase/supabase" "$tools/supabase/supabase-go"
           "$tools/supabase/supabase" --version | grep -F '2.118.0'
           pnpm install --frozen-lockfile --ignore-scripts
-          "$GITHUB_WORKSPACE/node_modules/.bin/wrangler" --version | grep -F '4.145.0'
+          "$GITHUB_WORKSPACE/node_modules/.bin/wrangler" --version | grep -F '4.156.2'
           test -x "$(command -v psql)"
 
       - name: Run read-only doctor

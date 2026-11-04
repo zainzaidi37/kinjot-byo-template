@@ -336,7 +336,7 @@ it. So the way back depends on what you have:
 - **Recovery records:** the configuration branch stores progress. `.kinjot/instance.json`
   holds a SHA-256 key fingerprint, product ownership, and lifecycle state;
   the license key stays in GitHub Secrets.
-- **Tooling:** Supabase CLI 2.118.0, pnpm 10.15.1, and Wrangler 4.145.0 are
+- **Tooling:** Supabase CLI 2.118.0, pnpm 10.15.1, and Wrangler 4.156.2 are
   installed before credentials are exposed. The frozen install disables lifecycle
   scripts. Vendored updater, verifier, and Doctor code fetch no npm code.
 
