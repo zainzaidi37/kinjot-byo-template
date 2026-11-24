@@ -118,8 +118,9 @@ function withIncompleteUpdate(report, attempt) {
       },
     },
   };
-  const summary = { healthy: 0, unhealthy: 0, unavailable: 0, not_configured: 0 };
-  for (const check of Object.values(checks)) summary[check.status]++;
+  // `runDoctor` scopes `report.summary` to the checks its status was computed
+  // from (core only under `--core`); the update check joins that count once.
+  const summary = { ...report.summary, unhealthy: report.summary.unhealthy + 1 };
   return {
     ...report,
     status: 'unhealthy',
