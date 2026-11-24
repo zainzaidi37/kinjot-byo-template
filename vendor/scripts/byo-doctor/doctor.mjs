@@ -362,6 +362,20 @@ export async function runDoctor(
         },
         timeoutMs,
       ),
+    // Open sign-ups let anyone who reaches the project create an account and
+    // spend its AI keys. Outside core readiness: an operator may open them on
+    // purpose, and the setup/update chain does not depend on them.
+    authSignups: () =>
+      check(
+        adapters.authConfig,
+        (value) => {
+          if (typeof value?.disableSignup !== 'boolean') invalid();
+          return value.disableSignup
+            ? result('healthy', 'signups_closed')
+            : result('unhealthy', 'signups_open');
+        },
+        timeoutMs,
+      ),
     // Core-only diagnostics withhold the optional provider probes outright: the
     // Voyage probe is billable, so the flag must suppress the call itself rather
     // than trust the caller to omit the adapters. A withheld probe reports
@@ -434,12 +448,28 @@ export async function runDoctor(
 
 export function formatReport(report) {
   const lines = [`Kinjot doctor: ${report.status}`, 'Read-only diagnostics; no changes made.'];
-  if (report.readiness?.localAiProbe) {
+  // The provider probes run only on keys supplied to this process, and
+  // `customer-cli.mjs` `doctor` supplies none under `--core`, which
+  // `customer-template/.github/workflows/kinjot-deployment.yml` runs; so their
+  // lines appear only when there were some, and otherwise `AI secrets in
+  // Supabase` is the AI line.
+  const probed = report.readiness?.localAiProbe?.credentials !== 'not_configured';
+  if (report.readiness?.localAiProbe && probed) {
     lines.push(
       `Locally supplied AI probe credentials: ${report.readiness.localAiProbe.credentials}; provider health: ${report.readiness.localAiProbe.health}`,
     );
   }
+  // Without `--core` the summary counts every check, unsupplied probes
+  // included, and they can set the headline; one line then says why.
+  const counted = Object.values(report.summary ?? {}).reduce((total, n) => total + n, 0);
+  const unprobed = ['openai', 'voyage'].filter(
+    (name) => report.checks[name]?.status === 'not_configured',
+  );
+  if (unprobed.length && counted === Object.keys(report.checks).length) {
+    lines.push(`${unprobed.join(', ')}: not_configured (no local probe keys supplied)`);
+  }
   for (const [name, c] of Object.entries(report.checks)) {
+    if (unprobed.includes(name)) continue;
     lines.push(`${name}: ${c.status} (${c.code})`);
     if (name === 'aiSecrets') {
       const presence = c.details?.presence
@@ -447,6 +477,11 @@ export function formatReport(report) {
         .join(', ');
       lines.push(
         `AI secrets in Supabase: ${presence ?? c.status} (names only; values are never kept or shown)`,
+      );
+    }
+    if (name === 'authSignups' && c.code === 'signups_open') {
+      lines.push(
+        '  Sign-ups are open: anyone who reaches the project can create an account and use its AI keys. Setup closes them on the first install; to close them now, turn off Allow new users to sign up under Authentication → Sign In / Providers in Supabase.',
       );
     }
     const d = c.details;
@@ -459,7 +494,9 @@ export function formatReport(report) {
     }
     if (name === 'epoch') lines.push(`  Expected ${d.expected}; database declares ${d.actual}`);
     if (name === 'marker')
-      lines.push(`  Self-hosted: ${d.selfHosted === null ? 'singleton absent' : d.selfHosted}`);
+      lines.push(
+        `  Self-hosted marker: ${d.selfHosted === null ? 'not set (the row is missing)' : d.selfHosted ? 'on' : 'off'}`,
+      );
     if (name === 'extensions') {
       for (const e of d.installed) lines.push(`  ${e.name}: ${e.version}`);
       if (d.missing.length) lines.push(`  Missing: ${d.missing.join(', ')}`);
@@ -497,9 +534,7 @@ export function formatReport(report) {
     );
   }
   lines.push(
-    'Provider health checks only locally supplied credentials. Supabase secret presence does not establish provider health.',
-    'Backfill count includes Trash and excludes existing embeddings and all existing jobs, including abandoned jobs.',
-    'Function status is deployment metadata, not an invocation or a proof of provider configuration.',
+    `Limits: function status is deployment state, not a test call; the backfill count includes Trash and skips notes that already have an embedding or a job; ${probed ? 'provider health covers only the keys supplied here, not the ones in Supabase' : 'AI keys in Supabase are listed by name, not tested'}.`,
   );
   return lines.join('\n') + '\n';
 }

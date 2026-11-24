@@ -1,6 +1,7 @@
 import { Buffer } from 'node:buffer';
 import { createHash, randomBytes } from 'node:crypto';
 import { stableJson } from '../byo-release/manifest.mjs';
+import { UpdaterRefusal } from './refusal.mjs';
 
 const LICENSE_ORIGIN = 'https://api.lemonsqueezy.com';
 const MAX_BODY = 256 * 1024;
@@ -10,6 +11,30 @@ const INTENT_ID = /^[a-f0-9]{32}$/;
 
 function fail(message) {
   return new Error(message);
+}
+
+/**
+ * The class of a failed Lemon Squeezy answer, carried on the fixed error so a
+ * caller can name the cause without the body: `rejected` is a definite
+ * refusal of the key (a 4xx other than 408 and 429, or a 2xx that says the key
+ * is not valid for this product), and `unavailable` is everything else (no
+ * answer, a timeout, 408, 429, 5xx, or an answer that cannot be read). The
+ * response body never rides on the error.
+ */
+function failWith(message, licenseFailure) {
+  return Object.assign(fail(message), { licenseFailure });
+}
+
+export function licenseFailureClass(error) {
+  try {
+    return error?.licenseFailure === 'rejected' ? 'rejected' : 'unavailable';
+  } catch {
+    return 'unavailable';
+  }
+}
+
+function rejectedStatus(status) {
+  return Number.isInteger(status) && status >= 400 && status < 500 && ![408, 429].includes(status);
 }
 
 async function boundedJson(response) {
@@ -41,24 +66,43 @@ async function request(fetchImpl, path, fields, timeoutMs, { allowNotFound = fal
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetchImpl(`${LICENSE_ORIGIN}${path}`, {
-      method: 'POST',
-      redirect: 'error',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams(fields).toString(),
-      signal: controller.signal,
-    });
-    if (allowNotFound && response?.status === 404) {
+    let response;
+    try {
+      response = await fetchImpl(`${LICENSE_ORIGIN}${path}`, {
+        method: 'POST',
+        redirect: 'error',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams(fields).toString(),
+        signal: controller.signal,
+      });
+    } catch {
+      throw failWith('license operation failed', 'unavailable');
+    }
+    let status;
+    let ok = false;
+    try {
+      status = response?.status;
+      ok = response?.ok === true;
+    } catch {
+      // A hostile accessor is reduced to an unreadable answer below.
+    }
+    if ((allowNotFound && status === 404) || !ok) {
       try {
-        await response.body?.cancel?.();
+        await response?.body?.cancel?.();
       } catch {
         // The status is the only trusted field on this response.
       }
-      return null;
+      if (allowNotFound && status === 404) return null;
+      throw failWith(
+        'license operation failed',
+        rejectedStatus(status) ? 'rejected' : 'unavailable',
+      );
     }
-    return await boundedJson(response);
-  } catch {
-    throw fail('license operation failed');
+    try {
+      return await boundedJson(response);
+    } catch {
+      throw failWith('license operation failed', 'unavailable');
+    }
   } finally {
     clearTimeout(timer);
   }
@@ -146,7 +190,7 @@ export function createLinkingIntent({ licenseKey, instanceName, expected }) {
 export function assertIntentLicense(config, licenseKey) {
   instanceConfigBytes(config);
   if (config.licenseFingerprint !== licenseFingerprint(licenseKey)) {
-    throw fail('license key does not own the durable lifecycle intent');
+    throw new UpdaterRefusal('license_key_mismatch');
   }
   return config;
 }
@@ -248,6 +292,22 @@ export async function validateLicenseAvailability({
     { license_key: licenseKey },
     timeoutMs,
   );
+  let refused = false;
+  try {
+    // Only an answer about this key refuses it: `valid: false`, or the key
+    // itself on a named other store or product, or an expired or disabled key.
+    refused =
+      body?.valid === false ||
+      (body?.valid === true &&
+        body.license_key?.key === licenseKey &&
+        ((Number.isSafeInteger(body.meta?.store_id) &&
+          Number.isSafeInteger(body.meta?.product_id) &&
+          !matchingLicense(body, licenseKey, config)) ||
+          ['expired', 'disabled'].includes(body.license_key.status)));
+  } catch {
+    // An unreadable answer is ambiguous below, never a refusal of the key.
+  }
+  if (refused) throw failWith('license availability validation was refused', 'rejected');
   if (
     body?.valid !== true ||
     body.error !== null ||
@@ -256,14 +316,14 @@ export async function validateLicenseAvailability({
     !Number.isSafeInteger(body.license_key.activation_usage) ||
     body.license_key.activation_usage < 0
   ) {
-    throw fail('license availability validation was ambiguous');
+    throw failWith('license availability validation was ambiguous', 'unavailable');
   }
   const usage = body.license_key.activation_usage;
   if (
     (usage === 0 && body.license_key.status !== 'inactive') ||
     (usage > 0 && body.license_key.status !== 'active')
   ) {
-    throw fail('license availability validation was ambiguous');
+    throw failWith('license availability validation was ambiguous', 'unavailable');
   }
   return Object.freeze({ status: usage === 0 ? 'available' : 'occupied', activationUsage: usage });
 }
