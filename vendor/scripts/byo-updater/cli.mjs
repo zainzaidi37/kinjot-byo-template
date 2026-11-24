@@ -39,21 +39,42 @@ const CLI_MIGRATION_SQLSTATES = new Set([
   '57014',
   'JN002',
 ]);
-const GENERIC_FAILURE = 'BYO updater failed. Run doctor and review the operator guide.\n';
+const RECOVERY_POINTER =
+  'See "Recovering a failed run" in this repository\'s README (README.md#recovering-a-failed-run).';
+// The command names a failure line may repeat; anything else is "updater".
+const CLI_COMMANDS = new Set([
+  'setup',
+  'update',
+  'link',
+  'unlink',
+  'backfill',
+  'doctor',
+  'repair-guide',
+  'migration-repair',
+]);
 
-export function formatCliFailure(error, command) {
+/**
+ * `installed` is the caller's evidence that an authenticated installed release
+ * exists, so `doctor` can run: `customer-cli.mjs` `doctor` refuses without one,
+ * and only then does the line suggest it.
+ */
+export function formatCliFailure(error, command, { installed = false } = {}) {
+  const name = CLI_COMMANDS.has(command) ? command : 'updater';
   const guidance =
-    command === 'doctor'
-      ? 'Review the operator guide.'
-      : 'Run doctor and review the operator guide.';
-  const genericFailure =
-    command === 'doctor' ? `BYO updater failed. ${guidance}\n` : GENERIC_FAILURE;
+    installed && command !== 'doctor'
+      ? `Run doctor from the Kinjot deployment workflow to see the deployment's state. ${RECOVERY_POINTER}`
+      : RECOVERY_POINTER;
+  const genericFailure = `Kinjot ${name} failed. ${guidance}\n`;
   try {
     if (error?.code === 'license_recovery_required') {
       if (error.recoveryAction === 'unlink') {
-        return 'License unlink recovery is required. The durable unlink intent is retained; inspect the exact stored instance and same-key activation state, then retry Unlink.\n';
+        return 'Kinjot could not confirm the license deactivation, so the unlink is not finished. Its progress record stays in this repository. Run unlink again; it checks the same activation before it finishes.\n';
       }
-      return 'License lifecycle recovery is required. Supply the exact provider instance UUID with the Link recovery input; no new activation was attempted.\n';
+      // A link recovery is resolved only by `link` (also inside `setup`); never
+      // name `unlink`, whose `activation_pending` path refuses without asking
+      // the provider (`customer-cli.mjs` `unlink`).
+      const rerun = command === 'setup' ? 'setup' : 'link';
+      return `Kinjot could not confirm whether this deployment's license activation went through, so it stopped without activating again. Run ${rerun}${command === rerun ? ' again' : ''}: it checks the license first, and links normally when no activation exists. If it stops here again, the license is activated somewhere: deactivate that activation in Lemon Squeezy's My Orders (https://app.lemonsqueezy.com/my-orders), then run ${rerun} again. If you know the activation's instance id, you can instead run link with it in license_instance_id.\n`;
     }
     const refusal = updaterRefusalMessage(error, command);
     if (refusal) return `${refusal}\n`;
@@ -78,7 +99,7 @@ export function formatCliFailure(error, command) {
       operation === 'function deployment' || operation === 'web publication'
         ? formatProcessDiagnostic(error)
         : '';
-    return `BYO updater ${operation} failed${sqlstate}. ${guidance}\n${diagnostic}`;
+    return `Kinjot ${name} failed during ${operation}${sqlstate}. ${guidance}\n${diagnostic}`;
   } catch {
     return genericFailure;
   }
@@ -173,7 +194,7 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
       adapters,
       stateStore,
     });
-    process.stdout.write('Authenticated BYO release installed.\n');
+    process.stdout.write('Installed the Kinjot release (signature verified).\n');
     return;
   }
   if (command === 'backfill') {

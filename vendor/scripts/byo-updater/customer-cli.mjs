@@ -19,18 +19,23 @@ import {
   confirmedUnlink,
   createLinkingIntent,
   deactivateLicense,
+  licenseFailureClass,
   pendingUnlink,
   validateLicenseAvailability,
   validateLicenseInstance,
 } from './license-lifecycle.mjs';
-import { validateOperatorConfig } from './operator-config.mjs';
+import {
+  projectRefFromDatabaseUrl,
+  sessionPoolerDatabaseUrl,
+  validateOperatorConfig,
+} from './operator-config.mjs';
 import { createPsqlProbe, resolveDatabaseEndpoint } from './database-endpoint.mjs';
 import { downloadRelease } from './release-download.mjs';
 import { authenticateHandoffControl, readHandoffStateFile } from './handoff.mjs';
 import { acquireUpdateLock, authenticateInstalledControl, FileStateStore } from './state.mjs';
 import { runUpdate } from './updater.mjs';
 import { formatCliFailure, main as localUpdaterMain } from './cli.mjs';
-import { UpdaterRefusal } from './refusal.mjs';
+import { normalizeUpdaterRefusalReason, UpdaterRefusal } from './refusal.mjs';
 
 const CHANNEL_KEYS = [
   'schemaVersion',
@@ -182,7 +187,7 @@ function git(repository, args) {
     execFile(
       'git',
       ['-C', repository, ...args],
-      { env: { PATH: process.env.PATH, LANG: 'C' } },
+      { env: { PATH: process.env.PATH, LANG: 'C' }, timeout: 60_000, killSignal: 'SIGKILL' },
       (error, stdout) =>
         error
           ? reject(new UpdaterRefusal('repository_inspection_failed'))
@@ -264,10 +269,25 @@ async function doctorDatabaseUrl(repository, dependencies) {
 }
 
 async function withDoctorDatabaseUrl(repository, dependencies, operation) {
+  return withDatabaseUrl(() => doctorDatabaseUrl(repository, dependencies), operation);
+}
+
+// The commands that open the database through `cli.mjs`'s `configFromEnvironment`,
+// which reads `KINJOT_DATABASE_URL` as given. They get the endpoint `setup`,
+// `update` and `doctor` resolve, and a resolution refusal stops them. A new
+// database command goes both here (delegation) and in `dispatchCustomerCommand`'s
+// `command === …` literals (local runs), which `scripts/feature-map/lib.mjs` reads.
+const DATABASE_COMMANDS = new Set(['backfill', 'migration-repair']);
+
+async function withResolvedDatabaseUrl(repository, dependencies, operation) {
+  return withDatabaseUrl(() => operatorDatabaseUrl(repository, dependencies), operation);
+}
+
+async function withDatabaseUrl(resolveUrl, operation) {
   const previous = Object.hasOwn(process.env, 'KINJOT_DATABASE_URL')
     ? process.env.KINJOT_DATABASE_URL
     : undefined;
-  const resolved = await doctorDatabaseUrl(repository, dependencies);
+  const resolved = await resolveUrl();
   if (resolved !== undefined) process.env.KINJOT_DATABASE_URL = resolved;
   try {
     return await operation();
@@ -419,7 +439,9 @@ export async function selectInstalledControl(
     result =
       argv[0] === 'doctor' && doctorArgsValid(argv.slice(1))
         ? await withDoctorDatabaseUrl(repository, dependencies, runInstalled)
-        : await runInstalled();
+        : DATABASE_COMMANDS.has(argv[0])
+          ? await withResolvedDatabaseUrl(repository, dependencies, runInstalled)
+          : await runInstalled();
   } catch (error) {
     // The same fallback as the authentication catch above, for the same
     // reason: a diagnostic that cannot run when things are broken is
@@ -544,12 +566,39 @@ export async function update(repository, stateDirectory, mode, dependencies = {}
       stateStore: durable.checkpoint,
       expectedSelection: selected.expected,
     });
-    process.stdout.write(
-      `Authenticated BYO release ${result.release.version} sequence ${result.release.sequence} installed.\n`,
-    );
+    process.stdout.write(`Installed Kinjot ${result.release.version} (signature verified).\n`);
   } finally {
     await rm(archive, { force: true });
   }
+}
+
+// Intents whose activation request this process sent. A pending intent in
+// this set is never resolved from an availability answer here: Lemon Squeezy
+// may still record a request this process sent, so only a later run (a new
+// process) may read "no activation" as proof that none was made.
+const activationsSent = new Set();
+
+/**
+ * The availability check that runs before a new linking intent is written, so
+ * a key the provider refuses, an occupied license or a provider outage leaves
+ * nothing in the repository and nothing at the provider.
+ */
+async function assertLicenseAvailable(licenseKey, intent, dependencies) {
+  let availability;
+  try {
+    availability = await (dependencies.validateLicenseAvailability ?? validateLicenseAvailability)({
+      licenseKey,
+      config: intent,
+    });
+  } catch (error) {
+    if (normalizeUpdaterRefusalReason(error)) throw error;
+    throw new UpdaterRefusal(
+      licenseFailureClass(error) === 'rejected'
+        ? 'license_key_not_recognised'
+        : 'license_service_unavailable',
+    );
+  }
+  if (availability?.status !== 'available') throw new UpdaterRefusal('license_already_activated');
 }
 
 export async function link(repository, durable, channel, rest, dependencies) {
@@ -609,8 +658,27 @@ export async function link(repository, durable, channel, rest, dependencies) {
     process.stdout.write('Release instance linked and committed.\n');
     return;
   }
+  let resumed = false;
   if (lifecycle?.phase === 'activation_pending' && !adoption) {
-    throw licenseRecovery();
+    // An earlier run wrote this intent and may have sent its activation. Zero
+    // activations on this key, with the provider's `inactive` status and no
+    // instance, is the proof the adoption path below accepts: no activation
+    // exists, so this intent's activation is sent now. An occupied license, an
+    // error, or an intent this process already sent stays a recovery.
+    if (activationsSent.has(lifecycle.intentId)) throw licenseRecovery();
+    let availability;
+    try {
+      availability = await (
+        dependencies.validateLicenseAvailability ?? validateLicenseAvailability
+      )({ licenseKey, config: lifecycle });
+    } catch {
+      throw licenseRecovery();
+    }
+    if (availability?.status !== 'available') throw licenseRecovery();
+    process.stdout.write(
+      'The last link did not finish, and no activation exists for this license; linking now.\n',
+    );
+    resumed = true;
   }
   if (lifecycle?.phase === 'activation_pending' && adoption) {
     let ownership;
@@ -646,13 +714,19 @@ export async function link(repository, durable, channel, rest, dependencies) {
     return;
   }
   if (adoption) throw new UpdaterRefusal('adoption_requires_unresolved_link');
-  lifecycle = createLinkingIntent({
-    licenseKey,
-    instanceName,
-    expected: { storeId: channel.storeId, productId: channel.productId },
-  });
-  await durable.instance.checkpoint(lifecycle);
+  if (!resumed) {
+    // Built in memory and checked before it is written: the intent is durable
+    // only once the provider has answered that this key is free.
+    lifecycle = createLinkingIntent({
+      licenseKey,
+      instanceName,
+      expected: { storeId: channel.storeId, productId: channel.productId },
+    });
+    await assertLicenseAvailable(licenseKey, lifecycle, dependencies);
+    await durable.instance.checkpoint(lifecycle);
+  }
   let confirmed;
+  activationsSent.add(lifecycle.intentId);
   try {
     confirmed = await (dependencies.activateLicense ?? activateLicense)({
       licenseKey,
@@ -853,9 +927,17 @@ export async function setup(repository, stateDirectory, dependencies = {}) {
     dependencies,
   );
   const adapters = (dependencies.createUpdaterAdapters ?? createUpdaterAdapters)(config);
-  await adapters.preflightTarget({ mode });
-
   const lifecycle = await durable.instance.read();
+  // A first install goes only into an empty project, the predicate
+  // `assertApplicable` (`applicability.mjs`) applies later as
+  // `!stateExisted && !emptyBackend`. Checked here, before `link`, so a project
+  // that already holds tables refuses before the license is activated.
+  const initial = state === null && lifecycle?.status !== 'linked';
+  const target = await adapters.preflightTarget({ mode, initial });
+  if (initial && target?.emptyBackend !== true) {
+    throw new UpdaterRefusal('initial_backend_not_empty');
+  }
+
   if (lifecycle?.status !== 'linked') {
     const linkResult = await runLink(repository, durable, channel, [], dependencies);
     if (Number.isInteger(linkResult) && linkResult !== 0) return linkResult;
@@ -863,6 +945,26 @@ export async function setup(repository, stateDirectory, dependencies = {}) {
     assertIntentLicense(lifecycle, licenseKey);
     if (lifecycle.storeId !== channel.storeId || lifecycle.productId !== channel.productId) {
       throw new UpdaterRefusal('channel_mismatch');
+    }
+  }
+
+  // Zain's decision J1 of 2026-11-24: setup turns sign-ups off on the first
+  // install, while no deployment state exists (a rerun before any state is
+  // recorded checks again). `update` never reaches this.
+  if (state === null) {
+    const signups = await adapters.closeSignups();
+    if (signups === 'closed') {
+      output(
+        'Sign-ups were open on this project; setup turned them off. Reopen them under Authentication → Sign In / Providers if you want other people to create accounts.\n',
+      );
+    } else if (signups === 'open') {
+      output(
+        'Sign-ups are open and setup could not turn them off. Turn off "Allow new users to sign up" under Authentication → Sign In / Providers in the Supabase Dashboard unless you want other people to create accounts.\n',
+      );
+    } else if (signups !== 'already_closed') {
+      output(
+        'Setup could not check whether sign-ups are open on this project. Turn off "Allow new users to sign up" under Authentication → Sign In / Providers in the Supabase Dashboard unless you want other people to create accounts.\n',
+      );
     }
   }
 
@@ -886,24 +988,37 @@ export async function setup(repository, stateDirectory, dependencies = {}) {
   if (!completed?.installedRelease || completed.attempt !== null || completed.mode !== mode) {
     throw new UpdaterRefusal('installation_unverified');
   }
-  const installed = completed?.installedRelease;
-  output(
-    [
-      'Kinjot setup complete.',
-      `Core installation checks passed (${mode}).`,
-      ...(installed ? [`Release: ${installed.version} (sequence ${installed.sequence})`] : []),
-      `App: ${mode === 'backend-only' ? 'https://byo.kinjot.com' : `https://${config.pagesProject}.pages.dev`}`,
-      `Supabase project URL: https://${config.projectRef}.supabase.co`,
-      'Next: create a confirmed operator account in Supabase Auth.',
-      'Then open the app, enter the receipt license at the byo.kinjot.com gate when using the included app, and connect with your public project URL and publishable key.',
-      'AI is optional and was not checked here. Add provider secrets in Supabase later, then use Recheck in Kinjot Settings → Account → Enable AI.',
-    ].join('\n') + '\n',
-  );
+  // `customer-template/.github/workflows/kinjot-deployment.yml` runs
+  // `customer-template/scripts/walk.mjs` after `setup`, and the walk updates to
+  // the newest release, so this line says only what setup did.
+  output('First release installed; the workflow now updates to the newest release.\n');
+}
+
+/**
+ * Sets `KINJOT_SUPABASE_PROJECT_REF` from `KINJOT_DATABASE_URL` when it is unset
+ * or empty (the workflow passes an unset repository variable as ''). Never
+ * overwrites a set value.
+ */
+export function deriveProjectRef(env) {
+  if (env.KINJOT_SUPABASE_PROJECT_REF) return;
+  const derived = projectRefFromDatabaseUrl(env.KINJOT_DATABASE_URL);
+  if (derived) env.KINJOT_SUPABASE_PROJECT_REF = derived;
 }
 
 async function dispatchCustomerCommand(argv, dependencies) {
   const repository = resolve(process.env.GITHUB_WORKSPACE || process.cwd());
   const stateDirectory = join(repository, '.kinjot', 'deployment');
+  // Before delegation, which runs in this process, so an installed 0.1.0 or
+  // 0.2.0 control sees both. A set ref that disagrees with the URL is kept, and
+  // `databaseConnection` refuses it.
+  const sessionUrl = sessionPoolerDatabaseUrl(process.env.KINJOT_DATABASE_URL);
+  if (sessionUrl) {
+    process.env.KINJOT_DATABASE_URL = sessionUrl;
+    (dependencies.stderr ?? process.stderr).write(
+      'KINJOT_DATABASE_URL uses port 6543, the transaction pooler; using the session pooler on port 5432 of the same host.\n',
+    );
+  }
+  deriveProjectRef(process.env);
   const delegated = await (dependencies.selectInstalledControl ?? selectInstalledControl)(
     repository,
     stateDirectory,
@@ -924,7 +1039,13 @@ async function dispatchCustomerCommand(argv, dependencies) {
     await update(repository, stateDirectory, mode, dependencies);
     return;
   }
-  if (['backfill', 'repair-guide', 'migration-repair'].includes(command)) {
+  if (command === 'backfill' || command === 'migration-repair') {
+    await withResolvedDatabaseUrl(repository, dependencies, () =>
+      (dependencies.localUpdaterMain ?? localUpdaterMain)(argv),
+    );
+    return;
+  }
+  if (command === 'repair-guide') {
     await (dependencies.localUpdaterMain ?? localUpdaterMain)(argv);
     return;
   }
@@ -950,7 +1071,9 @@ export async function main(argv = process.argv.slice(2), dependencies = {}) {
     return await dispatchCustomerCommand(argv, dependencies);
   } catch (error) {
     if (authenticatedControlInvocation && argv[0] !== 'doctor') {
-      process.stderr.write(formatCliFailure(error, argv[0]));
+      // Delegation reached this control, so an authenticated installed release
+      // exists and `doctor` can run.
+      process.stderr.write(formatCliFailure(error, argv[0], { installed: true }));
       return 1;
     }
     // Doctor must throw through to the frozen bootstrap's diagnostic fallback.

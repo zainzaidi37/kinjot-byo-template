@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { lstat, mkdir, realpath } from 'node:fs/promises';
 import { dirname, relative, resolve, sep } from 'node:path';
+import { UpdaterRefusal } from './refusal.mjs';
 
 const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 const COMMIT = /^[a-f0-9]{40}$/;
@@ -14,7 +15,8 @@ function runGit(repository, args, exec = execFile) {
     exec(
       'git',
       ['-C', repository, ...args],
-      { env: { PATH: process.env.PATH, LANG: 'C' } },
+      // Every git call is bounded: `ls-remote` and `push` reach GitHub.
+      { env: { PATH: process.env.PATH, LANG: 'C' }, timeout: 60_000, killSignal: 'SIGKILL' },
       (error, stdout) => {
         if (error) reject(fixed('durable Git checkpoint failed'));
         else resolvePromise(String(stdout).trim());
@@ -85,7 +87,7 @@ export class GitCheckpointStore {
     const observed = (await this.git(repo, ['ls-remote', '--refs', 'origin', remoteRef])).split(
       /\s+/,
     )[0];
-    if (observed !== this.expectedHead) throw fixed('configuration branch changed unexpectedly');
+    if (observed !== this.expectedHead) throw new UpdaterRefusal('configuration_branch_moved');
     const written = await this.localStore.write(state);
     const sequence = written.updaterControl?.sequence;
     const paths = [`${path}/deployment-state.json`];
@@ -113,13 +115,17 @@ export class GitCheckpointStore {
     const beforePush = (await this.git(repo, ['ls-remote', '--refs', 'origin', remoteRef])).split(
       /\s+/,
     )[0];
-    if (beforePush !== this.expectedHead) throw fixed('configuration branch changed unexpectedly');
-    await pushWithLease({
-      git: this.git,
-      repository: repo,
-      remoteRef,
-      expectedHead: this.expectedHead,
-    });
+    if (beforePush !== this.expectedHead) throw new UpdaterRefusal('configuration_branch_moved');
+    try {
+      await pushWithLease({
+        git: this.git,
+        repository: repo,
+        remoteRef,
+        expectedHead: this.expectedHead,
+      });
+    } catch {
+      throw new UpdaterRefusal('configuration_push_rejected');
+    }
     this.expectedHead = commit;
     return written;
   }

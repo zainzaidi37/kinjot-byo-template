@@ -5,6 +5,7 @@ import { TextDecoder } from 'node:util';
 // Official API references:
 // - Supabase: https://supabase.com/docs/reference/api/v1-list-all-functions
 // - Supabase secrets: https://supabase.com/docs/reference/api/v1-list-all-secrets
+// - Supabase Auth config: https://supabase.com/docs/reference/api/v1-get-auth-service-config
 // - OpenAI: https://platform.openai.com/docs/api-reference/models/list
 // - Voyage: https://docs.voyageai.com/reference/embeddings-api-1
 
@@ -200,6 +201,23 @@ function parseSecrets(value) {
   });
 }
 
+/**
+ * The project's Auth config holds SMTP and OAuth secrets beside the one field
+ * the doctor reads, so only `disable_signup` leaves this function; the parsed
+ * body is dropped here and never returned, logged or kept.
+ */
+function parseAuthConfig(value) {
+  if (
+    value === null ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    typeof value.disable_signup !== 'boolean'
+  ) {
+    throw safeError('invalid_response');
+  }
+  return { disableSignup: value.disable_signup };
+}
+
 function providerResult(response) {
   if (!Number.isInteger(response?.status) || response.status < 100 || response.status > 599) {
     discardBody(response);
@@ -239,11 +257,12 @@ export function createHttpAdapters({
   const adapters = {};
 
   if (isPresent(managementToken)) {
-    for (const [endpoint, parse] of [
-      ['functions', parseFunctions],
-      ['secrets', parseSecrets],
+    for (const [name, endpoint, parse] of [
+      ['functions', 'functions', parseFunctions],
+      ['secrets', 'secrets', parseSecrets],
+      ['authConfig', 'config/auth', parseAuthConfig],
     ]) {
-      adapters[endpoint] = async () => {
+      adapters[name] = async () => {
         if (
           !PROJECT_REF.test(projectRef) ||
           !validCredential(managementToken) ||

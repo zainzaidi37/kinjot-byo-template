@@ -3,6 +3,7 @@ import { lstat, mkdir, readFile, realpath, rename, rm, unlink, writeFile } from 
 import { dirname, join, resolve } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { instanceConfigBytes } from './license-lifecycle.mjs';
+import { UpdaterRefusal } from './refusal.mjs';
 
 const COMMIT = /^[a-f0-9]{40}$/;
 const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
@@ -27,7 +28,8 @@ function runGit(repository, args, exec = execFile) {
     exec(
       'git',
       ['-C', repository, ...args],
-      { env: { PATH: process.env.PATH, LANG: 'C' } },
+      // Every git call is bounded: `ls-remote` and `push` reach GitHub.
+      { env: { PATH: process.env.PATH, LANG: 'C' }, timeout: 60_000, killSignal: 'SIGKILL' },
       (error, stdout) => (error ? reject(fixed()) : accept(String(stdout).trim())),
     );
   });
@@ -68,7 +70,9 @@ export class GitInstanceStore {
   }
 
   async assertExpectedHead() {
-    if ((await this.remoteHead()) !== this.expectedHead) throw fixed('competing_head');
+    if ((await this.remoteHead()) !== this.expectedHead) {
+      throw new UpdaterRefusal('configuration_branch_moved');
+    }
   }
 
   async pushCommit(commit) {
@@ -79,10 +83,14 @@ export class GitInstanceStore {
       try {
         observed = await this.remoteHead();
       } catch {
-        throw fixed('push_unresolved');
+        throw new UpdaterRefusal('configuration_push_rejected');
       }
       if (observed !== commit) {
-        throw fixed(observed === this.expectedHead ? 'push_rejected' : 'competing_head');
+        throw new UpdaterRefusal(
+          observed === this.expectedHead
+            ? 'configuration_push_rejected'
+            : 'configuration_branch_moved',
+        );
       }
     }
     this.expectedHead = commit;
@@ -119,7 +127,7 @@ export class GitInstanceStore {
         this.expectedHead = commit;
         return value;
       }
-      if (observed !== this.expectedHead) throw fixed('competing_head');
+      if (observed !== this.expectedHead) throw new UpdaterRefusal('configuration_branch_moved');
       if (commit !== this.expectedHead) await this.pushCommit(commit);
       return value;
     }

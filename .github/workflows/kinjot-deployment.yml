@@ -19,7 +19,7 @@ on:
           - repair-guide
           - migration-repair
       license_instance_id:
-        description: Exact provider instance UUID for recovery adoption after an unresolved link
+        description: Only for finishing an interrupted link; the activation's instance UUID is on Lemon Squeezy's My Orders page. Leave empty otherwise.
         required: false
         type: string
       migration_version:
@@ -63,16 +63,25 @@ jobs:
       - name: Pin Node
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 22.13.1
+          node-version: 22.23.5
 
       - name: Pin pnpm
         uses: pnpm/action-setup@f2b2b233b538f500472c7274c7012f57857d8ce0 # v4.1.0+3, deliberately not v6: byo-test-publication.yml
+        # The action's pnpm self-install prints its summary, including a
+        # newer-version hint, at info level; errors still print at warn.
+        # --no-deprecation drops DEP0169 (`url.parse`) from that same install.
+        env:
+          npm_config_loglevel: warn
+          NODE_OPTIONS: --no-deprecation
         with:
           version: 10.15.1
 
       - name: Prepare pinned operator tools before secrets are exposed
         timeout-minutes: 10
         shell: bash
+        env:
+          npm_config_update_notifier: 'false'
+          NODE_OPTIONS: --no-deprecation
         run: |
           set -euo pipefail
           tools="$GITHUB_WORKSPACE/.operator-tools"
@@ -89,8 +98,14 @@ jobs:
           test -f "$supabase_source/supabase-go"
           cp "$supabase_source/supabase" "$supabase_source/supabase-go" "$tools/supabase/"
           chmod +x "$tools/supabase/supabase" "$tools/supabase/supabase-go"
-          "$tools/supabase/supabase" --version | grep -F '2.118.0'
-          pnpm install --frozen-lockfile --ignore-scripts
+          # The pinned 2.118.0 prints its newer-version notice on stderr (L1
+          # run 45397964032), so the group's stderr is discarded; a failure
+          # here therefore fails the step without printing a reason. grep's
+          # output goes to /dev/null rather than `-q`, which could exit before
+          # the CLI finishes writing and fail the pipe under pipefail.
+          { "$tools/supabase/supabase" --version | grep -F '2.118.0' >/dev/null; } 2>/dev/null
+          # warn, not --silent: --silent drops an install error's message.
+          pnpm install --frozen-lockfile --ignore-scripts --loglevel=warn
           "$GITHUB_WORKSPACE/node_modules/.bin/wrangler" --version | grep -F '4.156.2'
           test -x "$(command -v psql)"
 
@@ -146,7 +161,7 @@ jobs:
           case "$OPERATION" in
             setup)
               node vendor/scripts/byo-updater/customer-cli.mjs setup
-              node scripts/walk.mjs
+              node scripts/walk.mjs --after-setup
               ;;
             update)
               # A dispatch walks to the newest release, one release per hop.

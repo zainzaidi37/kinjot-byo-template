@@ -2,6 +2,13 @@ import { isAbsolute } from 'node:path';
 import { UpdaterRefusal } from './refusal.mjs';
 
 const PROJECT_REF = /^[a-z0-9]{20}$/;
+const POOLER_HOST_SUFFIX = '.pooler.supabase.com';
+// Supavisor's transaction mode. Migrations need session mode, which Supavisor
+// serves on 5432 of the same host (`database-endpoint.mjs` uses the same pair).
+const TRANSACTION_POOLER_PORT = '6543';
+const SESSION_POOLER_PORT = '5432';
+// The Connect dialog's unfilled password, with or without its brackets.
+const PASSWORD_PLACEHOLDER = /^\[?your[-_ ]password\]?$/i;
 const NAME = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 function invalid() {
@@ -49,6 +56,9 @@ export function databaseConnection(databaseUrl, projectRef, timeoutMs) {
   if (!['postgres:', 'postgresql:'].includes(url.protocol) || !url.username || !url.password) {
     throw new UpdaterRefusal('database_url_invalid');
   }
+  if (PASSWORD_PLACEHOLDER.test(decoded(url.password))) {
+    throw new UpdaterRefusal('database_password_placeholder');
+  }
   if (
     url.hash ||
     url.pathname !== '/postgres' ||
@@ -61,7 +71,7 @@ export function databaseConnection(databaseUrl, projectRef, timeoutMs) {
   }
   const username = decoded(url.username);
   const directHost = url.hostname === `db.${projectRef}.supabase.co`;
-  const poolerHost = url.hostname.endsWith('.pooler.supabase.com');
+  const poolerHost = url.hostname.endsWith(POOLER_HOST_SUFFIX);
   if (!directHost && !poolerHost) throw new UpdaterRefusal('database_url_host_mismatch');
   if (directHost && username !== 'postgres') {
     throw new UpdaterRefusal('database_url_direct_username_invalid');
@@ -72,6 +82,12 @@ export function databaseConnection(databaseUrl, projectRef, timeoutMs) {
   const password = decoded(url.password);
   const passwordless = new URL(url);
   passwordless.password = '';
+  // `customer-cli.mjs` rewrites 6543 before delegating and says so. For a caller
+  // that skipped that rewrite, only `passwordlessUrl` (`supabase db push` in
+  // `apply-adapters.mjs`, `supabase migration repair` in `manual-operations.mjs`)
+  // and `psqlEnv.PGPORT` move to 5432; the caller's `databaseUrl`, which the read
+  // adapters take, keeps 6543.
+  if (poolerHost && url.port === TRANSACTION_POOLER_PORT) passwordless.port = SESSION_POOLER_PORT;
   // pgconn defaults to prefer (including plaintext fallback) without this URL option.
   if (!passwordless.searchParams.has('sslmode'))
     passwordless.searchParams.set('sslmode', 'require');
@@ -86,11 +102,56 @@ export function databaseConnection(databaseUrl, projectRef, timeoutMs) {
       PGDATABASE: decoded(url.pathname.slice(1)),
       PGHOST: url.hostname,
       PGPASSWORD: password,
-      PGPORT: url.port || '5432',
+      PGPORT: passwordless.port || '5432',
       PGSSLMODE: url.searchParams.get('sslmode') || 'require',
       PGUSER: username,
     }),
   });
+}
+
+function parsedDatabaseUrl(databaseUrl) {
+  if (typeof databaseUrl !== 'string' || !databaseUrl) return null;
+  try {
+    const url = new URL(databaseUrl);
+    return ['postgres:', 'postgresql:'].includes(url.protocol) ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The project ref a Supabase database URL names: the direct host is
+ * `db.<ref>.supabase.co`, and a pooler URL's user is `postgres.<ref>`. Returns
+ * null for any other URL, so `databaseConnection` keeps its own refusal.
+ */
+export function projectRefFromDatabaseUrl(databaseUrl) {
+  const url = parsedDatabaseUrl(databaseUrl);
+  if (!url) return null;
+  const direct = /^db\.([a-z0-9]{20})\.supabase\.co$/.exec(url.hostname)?.[1];
+  if (direct) return direct;
+  if (!url.hostname.endsWith(POOLER_HOST_SUFFIX)) return null;
+  let username;
+  try {
+    username = decodeURIComponent(url.username);
+  } catch {
+    return null;
+  }
+  const pooled = /^postgres\.([a-z0-9]{20})$/.exec(username)?.[1];
+  return pooled ?? null;
+}
+
+/**
+ * The same URL on the session pooler's port when it names Supavisor's
+ * transaction port on a pooler host; otherwise null. A rewrite rather than a
+ * refusal, because an install configured on 6543 must keep updating.
+ */
+export function sessionPoolerDatabaseUrl(databaseUrl) {
+  const url = parsedDatabaseUrl(databaseUrl);
+  if (!url || !url.hostname.endsWith(POOLER_HOST_SUFFIX) || url.port !== TRANSACTION_POOLER_PORT) {
+    return null;
+  }
+  url.port = SESSION_POOLER_PORT;
+  return url.toString();
 }
 
 export function validateOperatorConfig(value, { mode = 'full', databaseOnly = false } = {}) {

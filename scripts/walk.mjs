@@ -14,8 +14,13 @@
  *
  * Bounds: at most `MAX_HOPS` hops per run, no new hop after `BUDGET_MS` of
  * walking, and each hop is killed after `HOP_TIMEOUT_MS`.
+ *
+ * With `--after-setup` (the workflow's `setup` operation), a walk that ends
+ * successfully on an installed release also prints the operator's next steps
+ * and appends them to the run's summary page (`GITHUB_STEP_SUMMARY`).
  */
 import { spawn } from 'node:child_process';
+import { appendFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readHandoffStateFile } from '../vendor/scripts/byo-updater/handoff.mjs';
@@ -48,7 +53,58 @@ export function childEnvironment(env) {
 /** `null` state (no state file) means nothing is installed. */
 export function installedFromState(state) {
   const release = state?.installedRelease ?? null;
-  return { sequence: release?.sequence ?? 0, version: release?.version ?? null };
+  return {
+    sequence: release?.sequence ?? 0,
+    version: release?.version ?? null,
+    mode: typeof state?.mode === 'string' ? state.mode : null,
+  };
+}
+
+/** The same name rule as `validateOperatorConfig` (`vendor/scripts/byo-updater/operator-config.mjs`). */
+const PAGES_PROJECT = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const INCLUDED_APP = 'https://byo.kinjot.com';
+
+/**
+ * The operator's next steps once setup has walked to its last release, as
+ * plain lines that also read as Markdown on the run's summary page. In
+ * `full` mode the app is the operator's own Pages site; the license gate is
+ * only on the included app at byo.kinjot.com (`workers/byo-origin/endpoint.ts`).
+ */
+export function completionBlock(installed, env = {}) {
+  const full = installed.mode === 'full';
+  const pages = env.KINJOT_PAGES_PROJECT;
+  const app = !full
+    ? INCLUDED_APP
+    : typeof pages === 'string' && PAGES_PROJECT.test(pages)
+      ? `https://${pages}.pages.dev`
+      : 'your Cloudflare Pages site';
+  return [
+    `Kinjot setup is complete: release ${installed.version} is installed.`,
+    '',
+    `App: ${app}`,
+    '',
+    'Next steps:',
+    '',
+    '1. Create your account. In Supabase, open Authentication → Users → Add user → Create new user, enter your email and a password, and tick Auto Confirm User.',
+    full
+      ? `2. Open ${app} and connect with your Project URL and publishable key (Supabase: Project Settings → API Keys). Sign in with the account from step 1.`
+      : `2. Open ${app}, enter your license key, and connect with your Project URL and publishable key (Supabase: Project Settings → API Keys). Sign in with the account from step 1.`,
+    '3. AI is optional. To turn it on, add OPENAI_API_KEY and VOYAGE_API_KEY under Edge Functions → Secrets in Supabase, then in Kinjot open Settings → AI provider → Enable AI and choose Recheck.',
+  ];
+}
+
+/**
+ * Appends to the run's summary page. Best effort: an unset variable or a
+ * failed write never changes the walk's result.
+ */
+export function appendStepSummary(text, env = process.env) {
+  const path = env.GITHUB_STEP_SUMMARY;
+  if (!path) return;
+  try {
+    appendFileSync(path, text);
+  } catch {
+    process.stderr.write('Could not add the next steps to the run summary; they are above.\n');
+  }
 }
 
 function describe(installed) {
@@ -63,6 +119,8 @@ function describe(installed) {
  * - `runHop(env)` runs one update and resolves to its exit code.
  * - `readState()` resolves to the durable state, or `null` when there is none.
  * - `now()` returns milliseconds; `write(line)` prints one line.
+ * - `summary(text)` appends to the run's summary page; it must not throw.
+ * - `afterSetup` adds the completion block to a successful end.
  *
  * Resolves to the process exit code.
  */
@@ -71,6 +129,8 @@ export async function runWalk({
   readState,
   now,
   write,
+  summary = () => {},
+  afterSetup = false,
   env = {},
   maxHops = MAX_HOPS,
   budgetMs = BUDGET_MS,
@@ -112,6 +172,16 @@ export async function runWalk({
       if (pin) write(`Stopped at the pinned release ${pin}.`);
       else if (after.sequence === 0) write('The deployment has no installed release.');
       else write(`Deployment is current at ${after.version} (sequence ${after.sequence}).`);
+      if (afterSetup && after.sequence > 0) {
+        const block = completionBlock(after, env);
+        write('');
+        for (const line of block) write(line);
+        try {
+          summary(`${block.join('\n')}\n`);
+        } catch {
+          // The block is already printed; the summary page is a copy of it.
+        }
+      }
       return 0;
     }
     if (after.sequence < before.sequence) {
@@ -183,6 +253,8 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
     readState: () => readHandoffStateFile(directory),
     now: () => Date.now(),
     write: (line) => process.stdout.write(`${line}\n`),
+    summary: (text) => appendStepSummary(text),
+    afterSetup: process.argv.slice(2).includes('--after-setup'),
     env: process.env,
   }).then(
     (code) => {

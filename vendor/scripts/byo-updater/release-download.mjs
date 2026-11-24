@@ -1,12 +1,21 @@
 import { createHash } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import { open, rm } from 'node:fs/promises';
+import { UpdaterRefusal } from './refusal.mjs';
 
 const SHA = /^[a-f0-9]{64}$/;
 const COMMIT = /^[a-f0-9]{40}$/;
 const VERSION =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 const MAX_ARCHIVE_BYTES = 512 * 1024 * 1024;
+const MAX_REFUSAL_BYTES = 4096;
+// The release Worker's fixed refusal vocabulary (`workers/release/endpoint.ts`
+// `fixedError`): a status reads as a cause only with its own category.
+const WORKER_REFUSALS = Object.freeze({
+  403: Object.freeze({ category: 'license_refused', reason: 'release_license_refused' }),
+  409: Object.freeze({ category: 'release_refused', reason: 'release_path_refused' }),
+  503: Object.freeze({ category: 'service_unavailable', reason: 'release_service_unavailable' }),
+});
 
 function error() {
   return new Error('release download failed');
@@ -81,6 +90,53 @@ async function upToDate(response, beforeDeadline) {
   }
 }
 
+/**
+ * The Worker's `{"error":"<category>"}` body on a 403, 409 or 503, read
+ * within the download's deadline and at most 4 KiB, as a refusal reason; any
+ * other status, size or shape is `null`, the plain download failure.
+ */
+async function workerRefusal(response, beforeDeadline) {
+  const expected = Object.hasOwn(WORKER_REFUSALS, response.status)
+    ? WORKER_REFUSALS[response.status]
+    : null;
+  if (!expected) return null;
+  const declared = response.headers.get('content-length');
+  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > MAX_REFUSAL_BYTES)) {
+    return null;
+  }
+  const reader = response.body?.getReader?.();
+  if (!reader) return null;
+  const chunks = [];
+  let bytes = 0;
+  for (let reads = 0; reads < 16; reads++) {
+    const { done, value } = await beforeDeadline(reader.read());
+    if (done) {
+      let parsed;
+      try {
+        parsed = JSON.parse(Buffer.concat(chunks, bytes).toString('utf8'));
+      } catch {
+        return null;
+      }
+      return parsed !== null &&
+        typeof parsed === 'object' &&
+        !Array.isArray(parsed) &&
+        Object.keys(parsed).join('\0') === 'error' &&
+        parsed.error === expected.category
+        ? expected.reason
+        : null;
+    }
+    bytes += value.byteLength;
+    if (bytes > MAX_REFUSAL_BYTES) break;
+    chunks.push(Buffer.from(value));
+  }
+  try {
+    void Promise.resolve(reader.cancel()).catch(() => {});
+  } catch {
+    // An oversized or endless body is the plain download failure.
+  }
+  return null;
+}
+
 export async function downloadRelease({
   endpoint,
   expectedR2Origin,
@@ -109,6 +165,7 @@ export async function downloadRelease({
   );
   const beforeDeadline = (operation) => Promise.race([operation, aborted]);
   let handle;
+  let refusal = null;
   try {
     const first = await beforeDeadline(
       fetchImpl(releaseUrl, {
@@ -123,7 +180,11 @@ export async function downloadRelease({
       await upToDate(first, beforeDeadline);
       return Object.freeze({ status: 'up-to-date' });
     }
-    if (first.status !== 303) throw error();
+    if (first.status !== 303) {
+      const reason = await workerRefusal(first, beforeDeadline);
+      if (reason) refusal = new UpdaterRefusal(reason);
+      throw refusal ?? error();
+    }
     const expected = selection(first);
     const location = new URL(header(first, 'location'));
     if (location.origin !== expectedR2Origin || location.protocol !== 'https:') throw error();
@@ -166,7 +227,7 @@ export async function downloadRelease({
   } catch {
     await handle?.close().catch(() => {});
     await rm(archivePath, { force: true });
-    throw error();
+    throw refusal ?? error();
   } finally {
     clearTimeout(timer);
   }
